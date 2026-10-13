@@ -1,3 +1,4 @@
+import asyncio
 import time
 from collections.abc import Callable
 
@@ -25,6 +26,10 @@ class LastReadingPowermeter(PowermeterWrapper):
     its passive reads go straight through and keep the meter's own staleness
     rule.
 
+    A passive read that finds no fresh reading first waits for a read of the
+    source already in flight, a battery's or another passive reader's, and
+    only reads the source itself if that one left nothing fresh behind.
+
     ``reset()`` passes through without forgetting the reading: it clears the
     filters' rolling state, and this is a fact about the meter.
     """
@@ -41,19 +46,39 @@ class LastReadingPowermeter(PowermeterWrapper):
         self._clock = clock or time.monotonic
         self._values: list[float] | None = None
         self._read_at: float | None = None
+        # The most recent read of the source still running. It resolves to
+        # None however that read ends: a waiting passive reader looks at the
+        # cache afterwards rather than at the read's outcome.
+        self._in_flight: asyncio.Future[None] | None = None
 
     async def get_powermeter_watts(self) -> list[float]:
-        values = await self.wrapped_powermeter.get_powermeter_watts()
-        if values:
-            self._values = list(values)
-            self._read_at = self._clock()
-        return values
+        done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._in_flight = done
+        try:
+            values = await self.wrapped_powermeter.get_powermeter_watts()
+            if values:
+                self._values = list(values)
+                self._read_at = self._clock()
+            return values
+        finally:
+            done.set_result(None)
+            if self._in_flight is done:
+                self._in_flight = None
 
     async def get_passive_watts(self) -> list[float]:
         if self.wrapped_powermeter.stream_online() is not None:
             return await self.wrapped_powermeter.get_passive_watts()
+        while True:
+            fresh = self._fresh_values()
+            if fresh is not None:
+                return fresh
+            if self._in_flight is None:
+                return await self.get_powermeter_watts()
+            await asyncio.shield(self._in_flight)
+
+    def _fresh_values(self) -> list[float] | None:
         if self._values is not None and stream_fresh(
             self._read_at, self.max_age, self._clock
         ):
             return list(self._values)
-        return await self.get_powermeter_watts()
+        return None

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from .conftest import FakePowermeter
@@ -25,6 +27,24 @@ class _CountingSource(FakePowermeter):
         if self.error is not None:
             raise self.error
         return await super().get_powermeter_watts()
+
+
+class _SlowSource(_CountingSource):
+    """A polled source whose reads stay in flight until ``release()``."""
+
+    def __init__(self, values: list[float]) -> None:
+        super().__init__(values)
+        self._gate = asyncio.Event()
+
+    def release(self) -> None:
+        self._gate.set()
+
+    async def get_powermeter_watts(self) -> list[float]:
+        self.reads += 1
+        await self._gate.wait()
+        if self.error is not None:
+            raise self.error
+        return list(self._values)
 
 
 class _PushSource(_CountingSource):
@@ -129,3 +149,50 @@ async def test_reset_keeps_the_reading() -> None:
     assert source.reset_count == 1
     assert await pm.get_passive_watts() == [100.0]
     assert source.reads == 1
+
+
+async def test_passive_read_waits_for_a_control_read_in_flight() -> None:
+    source = _SlowSource([100.0])
+    pm, _ = _make(source)
+
+    control = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    passive = asyncio.create_task(pm.get_passive_watts())
+    await asyncio.sleep(0)
+    source.release()
+
+    assert await control == [100.0]
+    assert await passive == [100.0]
+    assert source.reads == 1
+
+
+async def test_overlapping_passive_reads_share_one_source_read() -> None:
+    source = _SlowSource([42.0])
+    pm, _ = _make(source)
+
+    readers = [asyncio.create_task(pm.get_passive_watts()) for _ in range(3)]
+    await asyncio.sleep(0)
+    source.release()
+
+    assert await asyncio.gather(*readers) == [[42.0], [42.0], [42.0]]
+    assert source.reads == 1
+
+
+async def test_passive_read_reads_itself_when_the_read_it_waited_for_fails() -> None:
+    source = _SlowSource([100.0])
+    source.error = ValueError("offline")
+    pm, _ = _make(source)
+
+    control = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    passive = asyncio.create_task(pm.get_passive_watts())
+    await asyncio.sleep(0)
+    source.release()
+
+    with pytest.raises(ValueError):
+        await control
+    # The failure leaves nothing to reuse, so the passive reader asks the
+    # source and gets its own answer, never a stale value.
+    with pytest.raises(ValueError):
+        await passive
+    assert source.reads == 2
