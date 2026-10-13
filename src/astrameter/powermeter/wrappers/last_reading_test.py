@@ -58,6 +58,9 @@ class _PerReadSource(FakePowermeter):
     def finish(self, index: int, values: list[float]) -> None:
         self._pending[index].set_result(values)
 
+    def fail(self, index: int, error: Exception) -> None:
+        self._pending[index].set_exception(error)
+
     async def get_powermeter_watts(self) -> list[float]:
         self.reads += 1
         read: asyncio.Future[list[float]] = asyncio.get_running_loop().create_future()
@@ -80,7 +83,7 @@ def _make(
     return LastReadingPowermeter(source, max_age=max_age, clock=clock), clock
 
 
-async def test_raw_read_reuses_a_recent_control_read() -> None:
+async def test_passive_read_reuses_a_recent_control_read() -> None:
     source = _CountingSource([100.0, 200.0])
     pm, clock = _make(source)
 
@@ -92,7 +95,7 @@ async def test_raw_read_reuses_a_recent_control_read() -> None:
     assert source.reads == 1
 
 
-async def test_raw_read_reads_the_source_once_the_reading_is_too_old() -> None:
+async def test_passive_read_reads_the_source_once_the_reading_is_too_old() -> None:
     source = _CountingSource([100.0])
     pm, clock = _make(source)
     await pm.get_powermeter_watts()
@@ -108,7 +111,7 @@ async def test_raw_read_reads_the_source_once_the_reading_is_too_old() -> None:
     assert source.reads == 2
 
 
-async def test_raw_read_reads_the_source_when_nothing_has_read_it() -> None:
+async def test_passive_read_reads_the_source_when_nothing_has_read_it() -> None:
     source = _CountingSource([42.0])
     pm, _ = _make(source)
 
@@ -125,7 +128,7 @@ async def test_failed_or_empty_reads_are_not_remembered() -> None:
     source.error = ValueError("offline")
     with pytest.raises(ValueError):
         await pm.get_powermeter_watts()
-    # The raw read does not fall back to the old reading: it asks the source.
+    # The passive read does not fall back to the old reading: it asks the source.
     with pytest.raises(ValueError):
         await pm.get_passive_watts()
 
@@ -146,7 +149,7 @@ async def test_served_reading_is_a_copy() -> None:
     assert await pm.get_passive_watts() == [1.0, 2.0]
 
 
-async def test_push_meter_raw_read_goes_straight_to_its_cache() -> None:
+async def test_push_meter_passive_read_goes_straight_to_its_cache() -> None:
     """A push meter answers without I/O and applies its own staleness rule, so
     the wrapper must not serve a reading the meter itself would now refuse."""
     source = _PushSource([100.0])
@@ -237,3 +240,46 @@ async def test_passive_read_waits_for_every_control_read_in_flight() -> None:
     assert await older == [100.0]
     assert await passive == [100.0]
     assert source.reads == 2
+
+
+async def test_passive_read_does_not_wait_for_reads_started_after_it() -> None:
+    """A meter that keeps failing while battery polls overlap must still answer
+    a passive reader, with an error, rather than keep it waiting for ever."""
+    source = _PerReadSource()
+    pm, _ = _make(source)
+
+    first = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    passive = asyncio.create_task(pm.get_passive_watts())
+    await asyncio.sleep(0)
+    later = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+
+    source.fail(0, OSError("timeout"))
+    with pytest.raises(OSError):
+        await first
+    await asyncio.sleep(0)
+    # The passive reader asks the source itself instead of waiting for the
+    # battery read that started after it.
+    assert source.reads == 3
+    source.fail(2, OSError("timeout"))
+    with pytest.raises(OSError):
+        await passive
+
+    source.finish(1, [100.0])
+    assert await later == [100.0]
+
+
+async def test_source_reads_counts_every_answer_but_not_cache_hits() -> None:
+    source = _CountingSource([100.0])
+    pm, _ = _make(source)
+
+    await pm.get_powermeter_watts()
+    await pm.get_passive_watts()
+    source.set([])
+    await pm.get_powermeter_watts()
+    source.error = ValueError("offline")
+    with pytest.raises(ValueError):
+        await pm.get_powermeter_watts()
+
+    assert pm.source_reads == 2

@@ -15,7 +15,7 @@ def mock_powermeter() -> Mock:
     return pm
 
 
-async def test_transformed_raw_matches_wrapped_without_offset(
+async def test_transformed_passive_matches_wrapped_without_offset(
     mock_powermeter: Mock,
 ) -> None:
     mock_powermeter.get_powermeter_watts.return_value = [110.0, 210.0, 310.0]

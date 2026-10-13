@@ -59,6 +59,15 @@ class HealthTrackingPowermeter(PowermeterWrapper):
         # Last successful processed read, so the health loop can publish the
         # most recent readings without issuing an extra read.
         self._last_values: list[float] | None = None
+        # The wrapper that serves passive reads from the control loop's last
+        # read, if the chain has one: such a read is only news about the
+        # meter when it made the source answer.
+        node: Powermeter = wrapped_powermeter
+        while isinstance(node, PowermeterWrapper) and not isinstance(
+            node, LastReadingPowermeter
+        ):
+            node = node.wrapped_powermeter
+        self._last_reading = node if isinstance(node, LastReadingPowermeter) else None
 
     @property
     def last_attempt(self) -> float | None:
@@ -110,7 +119,25 @@ class HealthTrackingPowermeter(PowermeterWrapper):
         return result
 
     async def get_passive_watts(self) -> list[float]:
-        return await self._tracked(self.wrapped_powermeter.get_passive_watts)
+        shared = self._last_reading
+        if shared is None or self.stream_online() is not None:
+            return await self._tracked(self.wrapped_powermeter.get_passive_watts)
+        # A reading served from the cache was already recorded by the read
+        # that fetched it; recording it again would mark a meter that has
+        # failed since then as healthy. A failure always comes from the
+        # source, so it is recorded.
+        reads_before = shared.source_reads
+        attempt = self._clock()
+        try:
+            result = await self.wrapped_powermeter.get_passive_watts()
+        except Exception:
+            self._last_attempt = attempt
+            self._last_outcome_ok = False
+            raise
+        if shared.source_reads != reads_before:
+            self._last_attempt = attempt
+            self._last_outcome_ok = bool(result)
+        return result
 
     async def _tracked(self, fn: Callable[[], Awaitable[list[float]]]) -> list[float]:
         self._last_attempt = self._clock()

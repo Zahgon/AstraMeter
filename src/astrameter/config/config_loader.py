@@ -362,8 +362,11 @@ def apply_signal_wrappers(
     # Innermost, so passive readers see the source's own reading. The throttle
     # above it lets a control read through at most once per interval, so the
     # reading may be that much older before a passive reader reads for itself.
+    # A negative interval means no throttle, as below, not a cache that never
+    # expires.
     powermeter = LastReadingPowermeter(
-        powermeter, max_age=PASSIVE_READING_MAX_AGE_S + signal.throttle_interval
+        powermeter,
+        max_age=PASSIVE_READING_MAX_AGE_S + max(0.0, signal.throttle_interval),
     )
 
     if signal.offsets is not None or signal.multipliers is not None:

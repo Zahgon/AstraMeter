@@ -116,3 +116,58 @@ def test_pipeline_leaves_out_the_shared_reading() -> None:
     snapshot = pm.status_snapshot()
     assert snapshot.kind == "FakePowermeter"
     assert snapshot.pipeline == ("ThrottledPowermeter",)
+
+
+class _FailingSource(FakePowermeter):
+    """A polled source that can be switched to raising on every read."""
+
+    def __init__(self, values: list[float]) -> None:
+        super().__init__(values)
+        self.error: Exception | None = None
+
+    async def get_powermeter_watts(self) -> list[float]:
+        if self.error is not None:
+            raise self.error
+        return await super().get_powermeter_watts()
+
+
+def _shared(
+    source: Powermeter, clock: _FakeClock
+) -> tuple[HealthTrackingPowermeter, LastReadingPowermeter]:
+    shared = LastReadingPowermeter(source, max_age=5.0, clock=clock)
+    return _make(shared, clock=clock), shared
+
+
+async def test_cached_passive_read_does_not_mark_a_failing_meter_healthy() -> None:
+    """The reading a passive reader is served from the cache predates the
+    failure the control loop just saw, so it must not paper over it."""
+    clock = _FakeClock()
+    source = _FailingSource([100.0])
+    pm, _ = _shared(source, clock)
+    await pm.get_powermeter_watts()
+
+    clock.advance(1.0)
+    source.error = OSError("offline")
+    with pytest.raises(OSError):
+        await pm.get_powermeter_watts()
+    assert (pm.last_attempt, pm.last_outcome_ok) == (1.0, False)
+
+    clock.advance(1.0)
+    assert await pm.get_passive_watts() == [100.0]
+    assert (pm.last_attempt, pm.last_outcome_ok) == (1.0, False)
+
+
+async def test_passive_read_that_reads_the_source_is_recorded() -> None:
+    clock = _FakeClock()
+    source = _FailingSource([100.0])
+    pm, _ = _shared(source, clock)
+
+    clock.advance(1.0)
+    assert await pm.get_passive_watts() == [100.0]
+    assert (pm.last_attempt, pm.last_outcome_ok) == (1.0, True)
+
+    clock.advance(10.0)
+    source.error = OSError("offline")
+    with pytest.raises(OSError):
+        await pm.get_passive_watts()
+    assert (pm.last_attempt, pm.last_outcome_ok) == (11.0, False)

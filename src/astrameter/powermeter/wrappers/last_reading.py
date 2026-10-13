@@ -26,9 +26,13 @@ class LastReadingPowermeter(PowermeterWrapper):
     its passive reads go straight through and keep the meter's own staleness
     rule.
 
-    A passive read that finds no fresh reading first waits for a read of the
-    source already in flight, a battery's or another passive reader's, and
-    only reads the source itself if that one left nothing fresh behind.
+    A passive read that finds no fresh reading first waits for the reads of
+    the source already in flight when it arrived, a battery's or another
+    passive reader's, and reads the source itself only if they left nothing
+    fresh behind. Reads that start while it waits are not waited for, so a
+    meter that keeps failing under continuous battery polls answers the
+    passive reader after the reads it found running and one of its own,
+    rather than keeping it waiting for as long as the polls overlap.
 
     ``reset()`` passes through without forgetting the reading: it clears the
     filters' rolling state, and this is a fact about the meter.
@@ -51,12 +55,23 @@ class LastReadingPowermeter(PowermeterWrapper):
         # ends, so a waiting passive reader looks at the cache afterwards
         # rather than at the read's outcome.
         self._in_flight: set[asyncio.Future[None]] = set()
+        self._source_reads = 0
+
+    @property
+    def source_reads(self) -> int:
+        """How many reads of the source have returned, whatever they returned.
+
+        Lets the health wrapper tell a passive read the source answered from
+        one served from this cache, which proves nothing about the meter now.
+        """
+        return self._source_reads
 
     async def get_powermeter_watts(self) -> list[float]:
         done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._in_flight.add(done)
         try:
             values = await self.wrapped_powermeter.get_powermeter_watts()
+            self._source_reads += 1
             if values:
                 self._values = list(values)
                 self._read_at = self._clock()
@@ -68,17 +83,17 @@ class LastReadingPowermeter(PowermeterWrapper):
     async def get_passive_watts(self) -> list[float]:
         if self.wrapped_powermeter.stream_online() is not None:
             return await self.wrapped_powermeter.get_passive_watts()
+        pending = set(self._in_flight)
         while True:
             fresh = self._fresh_values()
             if fresh is not None:
                 return fresh
-            if not self._in_flight:
+            pending = {read for read in pending if not read.done()}
+            if not pending:
                 return await self.get_powermeter_watts()
             # asyncio.wait never cancels what it waits on, even if this
             # reader is cancelled, so the reads it waits for run to the end.
-            await asyncio.wait(
-                set(self._in_flight), return_when=asyncio.FIRST_COMPLETED
-            )
+            await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
     def _fresh_values(self) -> list[float] | None:
         if self._values is not None and stream_fresh(

@@ -72,7 +72,7 @@ async def test_read_ct_powermeter_calls_wait_with_2s_when_enabled() -> None:
     assert pm._wait_calls == [2]
 
 
-async def test_stub_powermeter_raw_matches_watts() -> None:
+async def test_stub_powermeter_passive_matches_watts() -> None:
     pm = _StubPowermeter([3.0, 4.0, 5.0])
     assert (
         await pm.get_passive_watts()
