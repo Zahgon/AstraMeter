@@ -46,14 +46,15 @@ class LastReadingPowermeter(PowermeterWrapper):
         self._clock = clock or time.monotonic
         self._values: list[float] | None = None
         self._read_at: float | None = None
-        # The most recent read of the source still running. It resolves to
-        # None however that read ends: a waiting passive reader looks at the
-        # cache afterwards rather than at the read's outcome.
-        self._in_flight: asyncio.Future[None] | None = None
+        # Every read of the source still running: battery polls can overlap
+        # when no throttle sits above. Each resolves to None however its read
+        # ends, so a waiting passive reader looks at the cache afterwards
+        # rather than at the read's outcome.
+        self._in_flight: set[asyncio.Future[None]] = set()
 
     async def get_powermeter_watts(self) -> list[float]:
         done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._in_flight = done
+        self._in_flight.add(done)
         try:
             values = await self.wrapped_powermeter.get_powermeter_watts()
             if values:
@@ -62,8 +63,7 @@ class LastReadingPowermeter(PowermeterWrapper):
             return values
         finally:
             done.set_result(None)
-            if self._in_flight is done:
-                self._in_flight = None
+            self._in_flight.discard(done)
 
     async def get_passive_watts(self) -> list[float]:
         if self.wrapped_powermeter.stream_online() is not None:
@@ -72,9 +72,13 @@ class LastReadingPowermeter(PowermeterWrapper):
             fresh = self._fresh_values()
             if fresh is not None:
                 return fresh
-            if self._in_flight is None:
+            if not self._in_flight:
                 return await self.get_powermeter_watts()
-            await asyncio.shield(self._in_flight)
+            # asyncio.wait never cancels what it waits on, even if this
+            # reader is cancelled, so the reads it waits for run to the end.
+            await asyncio.wait(
+                set(self._in_flight), return_when=asyncio.FIRST_COMPLETED
+            )
 
     def _fresh_values(self) -> list[float] | None:
         if self._values is not None and stream_fresh(

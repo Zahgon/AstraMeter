@@ -47,6 +47,24 @@ class _SlowSource(_CountingSource):
         return list(self._values)
 
 
+class _PerReadSource(FakePowermeter):
+    """A polled source whose reads each finish when the test says so."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.reads = 0
+        self._pending: list[asyncio.Future[list[float]]] = []
+
+    def finish(self, index: int, values: list[float]) -> None:
+        self._pending[index].set_result(values)
+
+    async def get_powermeter_watts(self) -> list[float]:
+        self.reads += 1
+        read: asyncio.Future[list[float]] = asyncio.get_running_loop().create_future()
+        self._pending.append(read)
+        return await read
+
+
 class _PushSource(_CountingSource):
     def stream_online(self) -> bool | None:
         return True
@@ -195,4 +213,27 @@ async def test_passive_read_reads_itself_when_the_read_it_waited_for_fails() -> 
     # source and gets its own answer, never a stale value.
     with pytest.raises(ValueError):
         await passive
+    assert source.reads == 2
+
+
+async def test_passive_read_waits_for_every_control_read_in_flight() -> None:
+    """Without a throttle, battery polls overlap. A newer one coming back
+    empty must not hide the older one still running from a passive reader."""
+    source = _PerReadSource()
+    pm, _ = _make(source)
+
+    older = asyncio.create_task(pm.get_powermeter_watts())
+    newer = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    passive = asyncio.create_task(pm.get_passive_watts())
+    await asyncio.sleep(0)
+
+    source.finish(1, [])
+    assert await newer == []
+    await asyncio.sleep(0)
+    assert not passive.done()
+
+    source.finish(0, [100.0])
+    assert await older == [100.0]
+    assert await passive == [100.0]
     assert source.reads == 2
