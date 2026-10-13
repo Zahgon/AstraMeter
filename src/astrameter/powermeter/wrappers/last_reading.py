@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 
 from astrameter.powermeter.base import Powermeter, stream_fresh
 
@@ -11,6 +13,34 @@ from .base import PowermeterWrapper
 #: Batteries poll about once a second, so while any battery reads this meter
 #: a passive reader never adds a request of its own.
 PASSIVE_READING_MAX_AGE_S = 5.0
+
+
+class PassiveReadProbe:
+    """Says whether one passive read was answered by the source."""
+
+    reached_source = False
+
+
+_probe: ContextVar[PassiveReadProbe | None] = ContextVar(
+    "passive_read_probe", default=None
+)
+
+
+@contextlib.contextmanager
+def probe_passive_read() -> Iterator[PassiveReadProbe]:
+    """Report whether the passive reads made inside reached the source.
+
+    The health wrapper uses it to tell a reading the source just gave from one
+    served from the cache, which proves nothing about the meter now. It goes
+    by the calling task, so reads other tasks make meanwhile, the batteries'
+    or other passive readers', do not count.
+    """
+    probe = PassiveReadProbe()
+    token = _probe.set(probe)
+    try:
+        yield probe
+    finally:
+        _probe.reset(token)
 
 
 class LastReadingPowermeter(PowermeterWrapper):
@@ -55,23 +85,12 @@ class LastReadingPowermeter(PowermeterWrapper):
         # ends, so a waiting passive reader looks at the cache afterwards
         # rather than at the read's outcome.
         self._in_flight: set[asyncio.Future[None]] = set()
-        self._source_reads = 0
-
-    @property
-    def source_reads(self) -> int:
-        """How many reads of the source have returned, whatever they returned.
-
-        Lets the health wrapper tell a passive read the source answered from
-        one served from this cache, which proves nothing about the meter now.
-        """
-        return self._source_reads
 
     async def get_powermeter_watts(self) -> list[float]:
         done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._in_flight.add(done)
         try:
             values = await self.wrapped_powermeter.get_powermeter_watts()
-            self._source_reads += 1
             if values:
                 self._values = list(values)
                 self._read_at = self._clock()
@@ -90,6 +109,9 @@ class LastReadingPowermeter(PowermeterWrapper):
                 return fresh
             pending = {read for read in pending if not read.done()}
             if not pending:
+                probe = _probe.get()
+                if probe is not None:
+                    probe.reached_source = True
                 return await self.get_powermeter_watts()
             # asyncio.wait never cancels what it waits on, even if this
             # reader is cancelled, so the reads it waits for run to the end.

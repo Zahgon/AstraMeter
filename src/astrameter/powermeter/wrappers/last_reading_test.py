@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from .conftest import FakePowermeter
-from .last_reading import LastReadingPowermeter
+from .last_reading import LastReadingPowermeter, probe_passive_read
 
 
 class _FakeClock:
@@ -270,16 +270,22 @@ async def test_passive_read_does_not_wait_for_reads_started_after_it() -> None:
     assert await later == [100.0]
 
 
-async def test_source_reads_counts_every_answer_but_not_cache_hits() -> None:
-    source = _CountingSource([100.0])
-    pm, _ = _make(source)
+async def test_probe_reports_only_this_tasks_source_reads() -> None:
+    source = _SlowSource([100.0])
+    pm, clock = _make(source)
 
-    await pm.get_powermeter_watts()
-    await pm.get_passive_watts()
-    source.set([])
-    await pm.get_powermeter_watts()
-    source.error = ValueError("offline")
-    with pytest.raises(ValueError):
-        await pm.get_powermeter_watts()
+    control = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    with probe_passive_read() as probe:
+        passive = asyncio.create_task(pm.get_passive_watts())
+        await asyncio.sleep(0)
+        source.release()
+        assert await passive == [100.0]
+    await control
+    # Served from the battery read it waited for, not from a read of its own.
+    assert probe.reached_source is False
 
-    assert pm.source_reads == 2
+    clock.now = 10.0
+    with probe_passive_read() as probe:
+        assert await pm.get_passive_watts() == [100.0]
+    assert probe.reached_source is True

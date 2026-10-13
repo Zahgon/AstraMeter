@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from astrameter.powermeter.base import Powermeter
 
 from .base import PowermeterWrapper
-from .last_reading import LastReadingPowermeter
+from .last_reading import LastReadingPowermeter, probe_passive_read
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -119,22 +119,22 @@ class HealthTrackingPowermeter(PowermeterWrapper):
         return result
 
     async def get_passive_watts(self) -> list[float]:
-        shared = self._last_reading
-        if shared is None or self.stream_online() is not None:
+        if self._last_reading is None or self.stream_online() is not None:
             return await self._tracked(self.wrapped_powermeter.get_passive_watts)
         # A reading served from the cache was already recorded by the read
-        # that fetched it; recording it again would mark a meter that has
-        # failed since then as healthy. A failure always comes from the
-        # source, so it is recorded.
-        reads_before = shared.source_reads
+        # that fetched it, and reads that finished while this one waited may
+        # have recorded something newer; recording it again could mark a
+        # meter that has failed since as healthy. Only an answer this call got
+        # from the source is news, and a failure always comes from the source.
         attempt = self._clock()
-        try:
-            result = await self.wrapped_powermeter.get_passive_watts()
-        except Exception:
-            self._last_attempt = attempt
-            self._last_outcome_ok = False
-            raise
-        if shared.source_reads != reads_before:
+        with probe_passive_read() as probe:
+            try:
+                result = await self.wrapped_powermeter.get_passive_watts()
+            except Exception:
+                self._last_attempt = attempt
+                self._last_outcome_ok = False
+                raise
+        if probe.reached_source:
             self._last_attempt = attempt
             self._last_outcome_ok = bool(result)
         return result

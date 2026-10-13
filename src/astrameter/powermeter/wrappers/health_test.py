@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -171,3 +172,45 @@ async def test_passive_read_that_reads_the_source_is_recorded() -> None:
     with pytest.raises(OSError):
         await pm.get_passive_watts()
     assert (pm.last_attempt, pm.last_outcome_ok) == (11.0, False)
+
+
+class _PerReadSource(FakePowermeter):
+    """A polled source whose reads each finish when the test says so."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self._pending: list[asyncio.Future[list[float]]] = []
+
+    def finish(self, index: int, values: list[float]) -> None:
+        self._pending[index].set_result(values)
+
+    def fail(self, index: int, error: Exception) -> None:
+        self._pending[index].set_exception(error)
+
+    async def get_powermeter_watts(self) -> list[float]:
+        read: asyncio.Future[list[float]] = asyncio.get_running_loop().create_future()
+        self._pending.append(read)
+        return await read
+
+
+async def test_passive_read_served_while_waiting_keeps_a_later_failure() -> None:
+    """A passive reader waiting on battery reads can be served the one that
+    succeeded after another has already failed; that failure is the newer
+    fact about the meter, so the passive read must not overwrite it."""
+    clock = _FakeClock()
+    source = _PerReadSource()
+    pm, _ = _shared(source, clock)
+
+    succeeding = asyncio.create_task(pm.get_powermeter_watts())
+    failing = asyncio.create_task(pm.get_powermeter_watts())
+    await asyncio.sleep(0)
+    passive = asyncio.create_task(pm.get_passive_watts())
+    await asyncio.sleep(0)
+
+    source.finish(0, [100.0])
+    source.fail(1, OSError("timeout"))
+    assert await succeeding == [100.0]
+    with pytest.raises(OSError):
+        await failing
+    assert await passive == [100.0]
+    assert pm.last_outcome_ok is False
