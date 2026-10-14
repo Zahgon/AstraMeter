@@ -4,6 +4,8 @@
 
 - **Fixed** the Marstek app and cloud reporting sending extra requests to a polled power meter, such as a Shelly or an HTTP source, on top of the batteries' own polls; they now reuse the batteries' latest reading ([#698](https://github.com/tomquist/astrameter/pull/698)).
 
+- **Fixed** a Marstek Venus E Mini failing to pair with the emulated CT ("configuration failed" in the app) when `CT_MAC` is set, and a `CT_MAC` entered in uppercase or with colons never pairing ([#727](https://github.com/tomquist/astrameter/pull/727), [#728](https://github.com/tomquist/astrameter/pull/728)).
+
 - **Fixed** a battery's Home Assistant entities staying unavailable until a restart since 2.3.1, after a network hiccup briefly dropped the battery and the MQTT connection at the same time ([#718](https://github.com/tomquist/astrameter/issues/718), [#719](https://github.com/tomquist/astrameter/pull/719)).
 
 - **Fixed** a battery sometimes staying stuck below its share since 2.3.1 while the other carried the rest, letting their charge levels drift apart; a battery that only paused briefly is now back to sharing within a minute ([#704](https://github.com/tomquist/astrameter/issues/704), [#707](https://github.com/tomquist/astrameter/pull/707)).
