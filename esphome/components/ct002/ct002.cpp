@@ -315,6 +315,11 @@ void CT002Component::handle_request_(const uint8_t *data, size_t len,
   }
   const auto &fields = *parsed;
   if (fields.size() < 4) return;
+  if (is_reader_mac(fields[1])) {
+    ESP_LOGD(TAG, "Ignoring CT002 request from %s: it is AstraMeter's own meter reader (%s)",
+             addr_ip.c_str(), fields[1].c_str());
+    return;
+  }
   if (!this->validate_ct_mac_(fields)) return;
 
   const std::string meter_mac = fields[1];
@@ -633,10 +638,10 @@ CT002Component::PhaseReports CT002Component::collect_reports_by_phase_() const {
     // Respect the request's "participate" flag: a battery that opted out (7th
     // field == 0) is not aggregated into the per-phase buckets or the count.
     if (!c.participates) continue;
-    // The real CT clears a slot that missed ~1-2 poll cycles before
-    // aggregating, so a battery that drops off the network stops being
-    // counted almost immediately. Mirror that per response here; the cleanup
-    // interval removes the entry shortly after (issue #462).
+    // Skip a consumer past its TTL per response, so a battery that drops off
+    // the network stops being counted at poll granularity rather than at the
+    // next cleanup interval, which removes the entry shortly after (issue
+    // #462). The real CT is slower here: it ages its slots in 30 s steps.
     if (this->consumer_expired_(c, now)) continue;
     const size_t idx = bucket_index_for_phase(c.phase);
     // Count every battery reporting into the bucket (regardless of power) so

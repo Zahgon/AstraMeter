@@ -7,18 +7,60 @@ This document summarizes the CT002/CT003 protocol based on community reverse‑e
 Capture-based findings for issue #111 are documented in:
 - [ct002-capture-analysis.md](ct002-capture-analysis.md)
 
-The CT002 and CT003 share the **same protocol**. The only difference is the CT type value:
-- **CT002:** `HME-4`
-- **CT003:** `HME-3`
+All CTs share the **same protocol**. What differs is the CT type value a
+battery puts in its requests and the CT names in its replies:
 
-CT003 additionally reads a P1/SML smart meter, so it carries cumulative energy
-data that CT002 does not (see "CT003 energy fields" below).
+| CT | Type |
+|----|------|
+| CT002, original hardware (TPM-100CTW) | `HME-4` |
+| CT002, newer hardware (TPM2-100CT) | `TPM2-0` |
+| CT003 | `HME-3` |
+
+A battery picks the type from its meter‑type setting. The Venus E 3.0
+firmware (`VNSE3-0` v150) maps setting 3 to `HME-4`, 4 to `HME-3`, 11 to
+`TPM2-0`, and 8–10 to `SMR-0`, `SMR-1` and `SMR-2`. It talks UDP to port 12345
+for all six. We don't know which products the `SMR-*` types belong to.
+
+CT003 and the newer CT002 (`TPM2-0`) also carry cumulative energy data that
+the original CT002 (`HME-4`) does not (see [Cumulative energy
+fields](#cumulative-energy-fields-fields-2528)).
+
+The CT‑side behavior described under [Transport](#transport), [What the CT
+accepts](#what-the-ct-accepts), [Aggregation, eviction and response
+cadence](#aggregation-eviction-and-response-cadence) and [CT MAC
+behavior](#ct-mac-behavior) was read from the decompiled CT firmware: CT002
+(`HME-4`) v120 and v124, and CT003 (`HME-3`) v116, v117, v118 and v122, from
+the firmware archives [rweijnen/marstek-firmware-archive][fw-archive] and
+[sphings79/marstek-firmware-archiv][fw-archive2]. The images are ARM Cortex‑M
+application images that load at `0x08006800`. Where a behavior differs
+between versions, the text names the versions.
+
+No `TPM2-0` firmware is public. What is known about it comes from captures in
+[#544](https://github.com/tomquist/astrameter/pull/544):
+- it answers a request from a battery MAC it has never seen;
+- it reports a battery with phase `0` and `participate = 0` in no bucket;
+- it sends the 28‑field reply.
+Everything else here is verified for `HME-4` and `HME-3` only.
 
 ## Transport
 
 - **Protocol:** UDP
-- **Port:** `12345`
+- **Port:** `12345` on the CT.
 - **Direction:** Storage system (consumer) sends a request to the CT. CT replies with measurements.
+- **Where the reply goes:** to the IP address and **source port the request
+  came from**. The CT stores both in the battery's slot and sends the reply
+  there. Batteries happen to send from port `22222` (see the
+  [capture analysis](ct002-capture-analysis.md)), but a request from any port
+  is answered on that port.
+- **No traffic of its own:** the CT never broadcasts, and every battery
+  protocol datagram it sends is a reply to a request. The only other UDP send
+  in the images is CT003's plain‑text `getkwhInfo:…` energy report. We haven't
+  found what triggers it, so treat it as unused.
+
+The CT's network stack is not on its main MCU. UDP runs on its Quectel Wi‑Fi
+module, which the MCU drives with AT commands: the socket is opened as a
+`"UDP SERVICE"` on local port 12345, and each incoming datagram arrives as a
+`+QIURC: "recv"` notice carrying the sender's IP and port.
 
 ## Frame Format
 
@@ -62,7 +104,7 @@ Request payload fields (consumer → CT):
 | — | length | 16‑bit int | leading digits of the framed packet |
 | 1 | **meter_dev_type** | string ≤ 10 | requester type (e.g. `HMG-50`); copied into the response |
 | 2 | **meter_mac_code** | string ≤ 30 | battery MAC (12 hex chars in practice, from the Marstek app) |
-| 3 | **hhm_dev_type** | string ≤ 8 | CT type (`HME-4` or `HME-3`) |
+| 3 | **hhm_dev_type** | string ≤ 8 | CT type (`HME-4`, `HME-3` or `TPM2-0`) |
 | 4 | **hhm_mac_code** | string ≤ 13 | CT MAC (12 hex chars) |
 | 5 | **phase** | single char | `A`/`B`/`C` = physical phase; `D` = **combined** (see "Phase selection"); `0`/empty = **unassigned / inspection** |
 | 6 | **phase_power** | 16‑bit signed | watts for the phase in field 5 (range −32768…32767) |
@@ -75,6 +117,45 @@ builds only fields 1–6, while the B2500 class (HMJ) builds a 7th field — its
 request template carries an extra trailing integer. The Venus class sends power
 as a 16‑bit value and the B2500 class as a 32‑bit value; both fit the same
 ASCII wire field.
+
+On the CT side, only CT002 v124 and CT003 v122 read field 7. The older images
+(CT002 v120, CT003 v116–v118) read fields 1–6 only. They still accept a request
+that carries a 7th field and simply ignore it, so for them every battery
+participates.
+
+### What the CT accepts
+
+The CT reads a request with
+`SOH STX %hd|%10[^|]|%30[^|]|%8[^|]|%13[^|]|%c|%hd|%hhu ETX` after checking
+the checksum. That is where the field widths in the table come from. It
+answers a request only when all of the following hold:
+
+- **The checksum matches** and fields 1–6 are present.
+- **`hhm_mac_code` is the wildcard `000000000000` or the CT's own MAC** (see
+  [CT MAC behavior](#ct-mac-behavior)).
+- **`hhm_dev_type` matches the CT's own type**, so `HME-4` reaches only an
+  original CT002 and `HME-3` only a CT003. A newer CT002 likewise ignored
+  requests until they named `TPM2-0` (#544). The comparison runs over the
+  length of the request's value, so it is strictly a prefix match. Every real
+  battery sends the full type, which is the only form worth relying on.
+
+Nothing else is checked. The CT does **not** validate `meter_dev_type` or
+`meter_mac_code`: it stores whatever arrives. It also keeps no list of
+batteries paired in the app, so it answers any battery that passes the checks
+above, provided a slot is free (see [Aggregation, eviction and response
+cadence](#aggregation-eviction-and-response-cadence)). A `phase` other than
+`A`–`D` is stored as `0`.
+
+A datagram whose payload starts with `Hello` is not parsed as a request. The
+CT counts it and keeps a copy, apparently for diagnostics, and never replies
+to it.
+
+> **AstraMeter's emulator is more lenient** on both stacks. It checks only
+> `hhm_mac_code` (see [CT MAC behavior](#ct-mac-behavior)), answers any
+> `hhm_dev_type`, and has no slot limit. The one request it drops is
+> AstraMeter's own: the `[MARSTEK_METER]` source polls a real CT as a battery
+> whose MAC starts with `02a57e`, and the emulator never answers that MAC, so
+> the source can't end up reading an emulator's output.
 
 ### Phase handling and inspection mode
 
@@ -158,7 +239,7 @@ The numeric section uses **four phase buckets plus one "unassigned" bucket**:
 
 | # | Field | Type / width | Meaning |
 |---|-------|--------------|---------|
-| 1 | **meter_dev_type** | string | CT/meter type (`HME-4` / `HME-3`) |
+| 1 | **meter_dev_type** | string | CT/meter type (`HME-4`, `HME-3` or `TPM2-0`) |
 | 2 | **meter_mac_code** | string | CT MAC |
 | 3 | **hhm_dev_type** | string | storage type (echoes request, e.g. `HMG-50`) |
 | 4 | **hhm_mac_code** | string | storage MAC (echoes request battery MAC) |
@@ -182,17 +263,18 @@ The numeric section uses **four phase buckets plus one "unassigned" bucket**:
 | 22 | **B_dchrg_power** | 16‑bit signed ² | phase B discharge sum |
 | 23 | **C_dchrg_power** | 16‑bit signed ² | phase C discharge sum |
 | 24 | **ABC_dchrg_power** | 16‑bit signed ² | combined‑bucket discharge sum |
-| 25 | **low_price_ele_in** | 32‑bit unsigned | (CT003 only) off‑peak import energy |
-| 26 | **normal_price_ele_in** | 32‑bit unsigned | (CT003 only) peak import energy |
-| 27 | **low_price_ele_out** | 32‑bit unsigned | (CT003 only) off‑peak export energy |
-| 28 | **normal_price_ele_out** | 32‑bit unsigned | (CT003 only) peak export energy |
+| 25 | **low_price_ele_in** | 32‑bit unsigned | (`HME-3`, `TPM2-0`) off‑peak import energy; all import on `TPM2-0` |
+| 26 | **normal_price_ele_in** | 32‑bit unsigned | (`HME-3`, `TPM2-0`) peak import energy; always `0` on `TPM2-0` so far |
+| 27 | **low_price_ele_out** | 32‑bit unsigned | (`HME-3`, `TPM2-0`) off‑peak export energy; all export on `TPM2-0` |
+| 28 | **normal_price_ele_out** | 32‑bit unsigned | (`HME-3`, `TPM2-0`) peak export energy; always `0` on `TPM2-0` so far |
 
 ¹ **Field‑width difference between models:** on **CT002 (`HME-4`)** the three
 per‑phase powers (fields 5–7) are **16‑bit signed** (±32767 W); the total
-(field 8) is 32‑bit. On **CT003 (`HME-3`)** all four are 32‑bit.
+(field 8) is 32‑bit. On **CT003 (`HME-3`)** all four are 32‑bit. The widths on
+`TPM2-0` are unknown.
 
-² The charge/discharge breakdown (fields 15–24) is **16‑bit signed on both
-models**, so each value saturates at ±32767 W.
+² The charge/discharge breakdown (fields 15–24) is **16‑bit signed on `HME-4`
+and `HME-3`**, so each value saturates at ±32767 W.
 
 These names match `RESPONSE_LABELS` in `src/astrameter/ct002/protocol.py`. In
 ordinary single/three‑phase traffic the `x_*` and `ABC_*` buckets are usually
@@ -232,43 +314,89 @@ the transient state while a device is still detecting its phase (`phase_t = 0`).
 > `'0'`/unassigned reporters (still detecting their phase) as inspection and serves
 > them the raw relay path.
 
-### CT003 energy fields (fields 25–28)
+### Cumulative energy fields (fields 25–28)
 
-CT003 (`HME-3`) — but **not** CT002 (`HME-4`) — appends **four** trailing
-unsigned‑32‑bit fields, making the CT003 response **28 fields** vs. CT002's 24.
-They are the cumulative import/export energy registers CT003 reads from a
-connected P1/SML smart meter, split by tariff. Their names are
-`low_price_ele_in`, `normal_price_ele_in`, `low_price_ele_out` and
-`normal_price_ele_out` — off‑peak/peak import and off‑peak/peak export. They
-correspond to the standard DSMR/SML registers `1-0:1.8.x` (import) and
-`1-0:2.8.x` (export). The exact scaling is the remaining unknown; the OBIS
-values are carried as `kWh` with three decimals. The AstraMeter emulator (a
-clamp‑style CT002) does not source a smart meter and does not emit these fields.
+CT003 (`HME-3`) and the newer CT002 (`TPM2-0`) — but **not** the original CT002
+(`HME-4`) — append **four** trailing unsigned‑32‑bit fields, making the reply
+**28 fields** instead of 24. Their names are `low_price_ele_in`,
+`normal_price_ele_in`, `low_price_ele_out` and `normal_price_ele_out`:
+off‑peak/peak import and off‑peak/peak export.
+
+**Scale: 0.1 Wh per count.** Two independent sources agree:
+- **CT003 firmware:** the CT003 reads these registers from a connected P1
+  smart meter, from the standard DSMR registers `1-0:1.8.1`/`1.8.2` (import)
+  and `1-0:2.8.1`/`2.8.2` (export). Its parser reads each `kWh` value as
+  integer and fraction and stores `kWh × 10000 + fraction × 10`. That is
+  0.1 Wh per count, provided the meter sends the usual three decimals. (We
+  traced the parse but not the copy into the reply.)
+- **`TPM2-0` captures** (#544): fields 25 and 27 rise by 0.1 Wh per count as
+  energy is imported and exported. Fields 26 and 28 have stayed `0`, and the
+  counters change only about every three minutes.
+
+The AstraMeter emulator does not source a smart meter and does not emit these
+fields.
 
 ## Aggregation, eviction and response cadence
 
-The CT keeps a table of up to **9 consumer slots**, keyed by battery MAC. Each
-incoming request updates the matching slot (or allocates a free one), storing
-the reporter's IP, type, phase, signed power, and `participate` flag.
+The CT keeps a table of battery slots, keyed by battery MAC:
 
-Per response cycle the CT:
+| Model | Slots |
+|-------|-------|
+| CT002 (`HME-4`) v120 and later | **15** (the v120 release notes: "raised the number of connectable slave devices to 15") |
+| CT003 (`HME-3`), every archived image (v116–v122) | **9** |
+| CT002 (`TPM2-0`) | unknown |
 
-1. **Evicts stale slots** — the CT clears any slot not refreshed within ~1–2 cycles.
-   (AstraMeter mirrors this by default: a consumer that misses ~2 of its own
-   poll cycles drops out of the counts/aggregates; set `CONSUMER_TTL` /
-   `consumer_ttl` to use a fixed window instead.)
+Each accepted request updates the matching slot or takes a free one. The slot
+stores the reporter's IP and source port, type, phase, signed power and
+`participate` flag. The request also resets the slot's age and marks the slot
+as waiting for a reply. When every slot is taken, a request from a new battery
+is dropped without a reply.
+
+The CT runs three jobs over the slot table:
+
+1. **Evicts stale slots.** Every 30 s the CT adds one to the age of every
+   occupied slot and clears any slot whose age has reached 2. Each request
+   resets the age to 0, so a battery that stops polling is dropped **30–60 s
+   after its last request**. (Earlier versions of this document said "within
+   ~1–2 cycles"; the firmware counts 30 s steps, not polls.) AstraMeter's
+   default is much stricter: a consumer drops out once it misses ~2 of its own
+   poll intervals (at least 5 s). Set `CONSUMER_TTL` / `consumer_ttl` to use a
+   fixed window instead; 60 s matches the real CT's upper bound.
 2. **Builds per‑bucket aggregates** over the live slots, but only for a slot that
    is occupied **and** has `participate != 0`:
    - bucket by phase (`A`/`B`/`C`, the combined `ABC` bucket for phase `D`, or
      the `x` bucket for the `'0'`/unassigned phase), and
    - **sign‑split** the power: negative → that bucket's `*_chrg_power`,
-     positive → its `*_dchrg_power`; bump the bucket's `*_chrg_nb` count.
-3. **Replies to one slave per cycle**, round‑robin across the active slots
-   (each requester receives its own unicast response).
+     positive → its `*_dchrg_power`; bump the bucket's `*_chrg_nb` count. The
+     `x` bucket has no count, so an unassigned reporter adds only its power. A
+     reporter with phase `0` and power `0` therefore leaves every count and
+     sum unchanged, on every firmware version.
+3. **Sends one reply per request.** The CT walks the slots in turn and answers
+   the next one that is waiting. Each requester gets its own unicast reply, to
+   the IP and port stored in its slot. A slot that sent no new request since
+   its last reply gets nothing, and a second request before the reply does not
+   queue a second one. After each reply the CT waits for the Wi‑Fi module to
+   confirm the send (giving up after 1 s). CT002 v124 and CT003 v122 then
+   **pause 500 ms** before serving the next slot; the older images move on
+   straight away. A current CT therefore sends at most about **two replies per
+   second, shared by all batteries**. With N batteries polling faster than
+   that, each gets a reply roughly every N × 0.5 s.
+
+The reply's measurement fields (`A/B/C_phase_power`, `total_power`) are the
+same for every requester. Only the identity fields and the aggregates depend
+on the slot table.
+
+If no request passes the checks in [What the CT accepts](#what-the-ct-accepts)
+for **30 minutes**, the CT logs `UDP:RESET` and reboots. This is present in
+every archived image.
+
+All timings above come from the firmware's 2 kHz timer interrupt (prescaler
+47, period 499), which drives a 1 ms and a 1 s counter. They assume the 48 MHz
+clock that prescaler implies.
 
 **Effect of `participate = 0` on steering.** The CT still **serves a normal
 response** to a non‑participating battery every cycle: step 2 leaves it out of the
-aggregation, but step 3 still includes it in the round‑robin. It keeps receiving
+aggregation, but step 3 still answers its requests. It keeps receiving
 the grid reading and the aggregates, so it can run its own program (e.g. a manual
 schedule) while reading the meter. But its power and its slot stay out of the
 per‑phase `*_chrg_power` / `*_dchrg_power` buckets **and** the `*_chrg_nb` count, so:
@@ -860,7 +988,7 @@ those are outside the scope of the meter emulator.) The reply omits any `cd=`
 echo. The aggregate (`cd=1`) field set **differs between models**:
 
 ```text
-CT002 (HME-4):
+CT002 (HME-4; the TPM2-0 layout has not been captured):
   pwr_a,pwr_b,pwr_c,pwr_t,ble_s,wif_r,fc4_v,ver_v,wif_s,slv_n,cur_d
 
 CT003 (HME-3):
